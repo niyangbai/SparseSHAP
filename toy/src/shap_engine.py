@@ -1,4 +1,6 @@
 import numpy as np
+import torch
+import torch.nn.functional as F
 from abc import ABC, abstractmethod
 from typing import Any
 import warnings
@@ -176,7 +178,7 @@ class SequentialSHAPApproximator(BaseSHAPApproximator):
 
         Args:
             model: The trained model for which SHAP values are to be approximated.
-                Must have a `predict` method.
+                Must be a PyTorch model.
             X_background (np.ndarray): Background dataset used for approximations.
                 Shape should be (n_samples, timesteps, features).
             num_samples (int, optional): Number of samples to use in the approximation.
@@ -222,7 +224,8 @@ class SequentialSHAPApproximator(BaseSHAPApproximator):
         shap_values = np.zeros_like(x_sample)
 
         try:
-            pred_x = self.model.predict(x_sample[np.newaxis, :, :])[0][0]
+            x_sample_tensor = torch.tensor(x_sample, dtype=torch.float32).unsqueeze(0)
+            pred_x = self.model(x_sample_tensor).item()
         except Exception as e:
             raise Exception(f"Model prediction failed on x_sample: {e}")
 
@@ -237,9 +240,11 @@ class SequentialSHAPApproximator(BaseSHAPApproximator):
                     self.X_background.shape[0], size=self.num_samples, replace=True
                 )
                 modified_samples[:, t, f] = self.X_background[random_indices, t, f]
+                # Convert modified samples to tensor
+                modified_samples_tensor = torch.tensor(modified_samples, dtype=torch.float32)
                 # Predict using the modified samples
                 try:
-                    preds_modified = self.model.predict(modified_samples)
+                    preds_modified = self.model(modified_samples_tensor).detach().numpy().flatten()
                 except Exception as e:
                     raise Exception(f"Model prediction failed on modified samples: {e}")
                 # Compute the average prediction when input at time t, feature f is replaced
@@ -283,3 +288,47 @@ class SequentialSHAPApproximator(BaseSHAPApproximator):
                 shap_values_list.append(np.zeros_like(x_sample))
 
         return np.array(shap_values_list)
+    
+    def batch_approximate_shap_values(self, X_test: np.ndarray) -> np.ndarray:
+        """Approximate SHAP values for multiple sequential samples in a batch manner.
+
+        Args:
+            X_test (np.ndarray): The input samples (sequences) for which to compute SHAP values.
+                Expected shape is (n_samples, timesteps, features).
+
+        Returns:
+            np.ndarray: The approximated SHAP values for the input samples.
+                Shape is (n_samples, timesteps, features).
+
+        Raises:
+            ValueError: If `X_test` is not a 3D numpy array.
+            ValueError: If sequence shape in `X_test` does not match `X_background`.
+        """
+        if not isinstance(X_test, np.ndarray) or X_test.ndim != 3:
+            raise ValueError("X_test must be a 3D numpy array.")
+
+        if X_test.shape[1:] != self.X_background.shape[1:]:
+            raise ValueError(
+                "Sequence shape in X_test must match the shape of sequences in X_background."
+            )
+
+        batch_shap_values = np.zeros_like(X_test)
+        X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+        baseline_tensor = torch.tensor(self.X_background, dtype=torch.float32)
+
+        # Forward pass for original predictions
+        preds_original = self.model(X_test_tensor).detach().numpy().flatten()
+
+        for t in range(X_test.shape[1]):
+            for f in range(X_test.shape[2]):
+                # Modify the input batch at time t, feature f with random background values
+                modified_X = X_test.copy()
+                random_indices = np.random.choice(self.X_background.shape[0], size=X_test.shape[0], replace=True)
+                modified_X[:, t, f] = self.X_background[random_indices, t, f]
+                modified_X_tensor = torch.tensor(modified_X, dtype=torch.float32)
+                # Forward pass for modified predictions
+                preds_modified = self.model(modified_X_tensor).detach().numpy().flatten()
+                # Compute SHAP values
+                batch_shap_values[:, t, f] = preds_original - preds_modified
+
+        return batch_shap_values
